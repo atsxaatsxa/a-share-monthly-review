@@ -1,0 +1,7 @@
+# A股月度持仓复盘 —— 依赖清单
+# 安装：pip install -r requirements.txt
+# 若默认源不可达（如沙箱/内网），可改用官方源：
+#   pip install -i https://pypi.org/simple --trusted-host pypi.org -r requirements.txt
+
+akshare>=1.12
+pandas>=2.0

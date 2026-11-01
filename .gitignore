@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 本地临时产物（复盘结果按 data/ 目录归档，根目录散落文件不入库）
+review_report_*.csv
+review_report_*.json
+
+# 环境与凭据
+.venv/
+venv/
+.env
+*.local
+
+# 编辑器 / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# WorkBuddy 项目元数据
+.workbuddy/
