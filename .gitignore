@@ -24,3 +24,7 @@ Thumbs.db
 
 # WorkBuddy 项目元数据
 .workbuddy/
+
+# 编辑器临时锁文件（预览/编辑器独占打开时生成）
+~$*
+*~
