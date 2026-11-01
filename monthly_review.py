@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-A股月度持仓复盘脚本 (v1 —— 东财数据源)
+A股月度持仓复盘脚本
 ==================================================================
+数据源 : akshare (优先) —— 多数据源兜底(东财 push2 -> 新浪)，任一源成功即采用
 核心红线 : 严禁下标顺序匹配 —— 所有行情一律以「标的名称(str)」为 dict key 绑定，
            任何读取都通过 key 取数，绝不依赖列表下标 / 循环顺序。
 功能 :
   1. 指定复盘月份 (命令行参数 YYYY-MM)
-  2. 拉取各标的与沪深300基准当月日线(qfq) —— 东财 push2 接口
+  2. 拉取各标的与沪深300基准当月日线(qfq)
   3. 计算个股月收益、基准收益、超额收益，区分贡献/拖累
   4. 控制台输出月报 + 导出 CSV(+JSON)
   5. 自动发送月报邮件至 xuyutom@qq.com (未配置SMTP则告警跳过)
@@ -33,6 +34,8 @@ import akshare as ak
 import pandas as pd
 
 # ============================ 集中配置 ============================
+# 复盘维度全以此字典为准；name 为唯一业务主键，symbol 为 akshare 代码。
+# 增加/减少标的只需改这里，其余逻辑自动适配 (可复现复用)。
 STOCKS: Dict[str, str] = {
     "五粮液": "000858",
     "万华化学": "600309",
@@ -42,14 +45,17 @@ STOCKS: Dict[str, str] = {
     "京沪高铁": "601816",
 }
 BENCHMARK_NAME = "沪深300"
-BENCHMARK_SYMBOL = "000300"
+BENCHMARK_SYMBOL = "000300"  # 沪深300 指数代码
 
+# 异常收益阈值：单月涨跌幅绝对值超过该值视为异常，需人工复核 (双向)
 ANOMALY_RETURN_THRESHOLD = 0.60
 
+# 接口容错
 MAX_RETRY = 3
-RETRY_BACKOFF = 2
-SOURCE_DELAY = 0.5
+RETRY_BACKOFF = 2      # 秒
+SOURCE_DELAY = 0.5     # 标的之间节流，降低被限流概率
 
+# 邮件配置：优先读环境变量，缺失则跳过发送并告警 (不阻断主流程)
 EMAIL_CONFIG = {
     "smtp_host": os.getenv("REVIEW_SMTP_HOST", ""),
     "smtp_port": int(os.getenv("REVIEW_SMTP_PORT", "465")),
@@ -60,7 +66,9 @@ EMAIL_CONFIG = {
 }
 
 
+# ============================ 工具函数 ============================
 def month_bounds(year: int, month: int):
+    """返回该月首日和末日 (date)。"""
     start = date(year, month, 1)
     last_day = calendar.monthrange(year, month)[1]
     end = date(year, month, last_day)
@@ -68,6 +76,7 @@ def month_bounds(year: int, month: int):
 
 
 def validate_month(review_month: str):
+    """输入自证：校验月份参数格式与合法性。非法直接抛错 → 主流程退出，绝不输出复盘。"""
     if not re.fullmatch(r"\d{4}-\d{2}", review_month or ""):
         raise ValueError(f"月份格式错误: '{review_month}'，应为 YYYY-MM（如 2024-01）")
     year, month = int(review_month[:4]), int(review_month[5:7])
@@ -75,6 +84,7 @@ def validate_month(review_month: str):
         raise ValueError(f"月份越界: {month}")
     if (year, month) > (date.today().year, date.today().month):
         raise ValueError(f"复盘月份 {review_month} 晚于当前月份，禁止输出未来复盘")
+    # 标的配置自证
     if not STOCKS:
         raise ValueError("标的配置为空")
     for name, sym in STOCKS.items():
@@ -84,86 +94,149 @@ def validate_month(review_month: str):
 
 
 def fetch_with_retry(func, *args, **kwargs):
+    """双向异常检测之——接口超时/网络异常重试。"""
     last_err = None
     for attempt in range(1, MAX_RETRY + 1):
         try:
             return func(*args, **kwargs)
-        except Exception as e:
+        except Exception as e:  # 含超时/连接异常
             last_err = e
             if attempt < MAX_RETRY:
                 time.sleep(RETRY_BACKOFF * attempt)
     raise last_err
 
 
+def _sina_symbol(symbol: str) -> str:
+    """A股代码转新浪格式：6开头->sh，其余->sz。"""
+    return ("sh" if symbol.startswith("6") else "sz") + symbol
+
+
+def _extract_close(df) -> Optional[pd.DataFrame]:
+    """从原始 df 抽取 (date, close) 归一化列；列名兼容东财(日期/收盘)与新浪(date/close)。"""
+    if df is None or (hasattr(df, "empty") and df.empty):
+        return None
+    dcol = "日期" if "日期" in df.columns else ("date" if "date" in df.columns else None)
+    ccol = "收盘" if "收盘" in df.columns else ("close" if "close" in df.columns else None)
+    if dcol is None or ccol is None:
+        return None
+    out = df[[dcol, ccol]].copy()
+    out.columns = ["date", "close"]
+    out["date"] = pd.to_datetime(out["date"])
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out = out.dropna().sort_values("date").reset_index(drop=True)
+    return out if not out.empty else None
+
+
+def _filter_range(df, start, end):
+    """对不支持起止参数的数据源(如新浪指数)做本地日期过滤。"""
+    norm = _extract_close(df)
+    if norm is None:
+        return None
+    mask = (norm["date"] >= pd.Timestamp(start)) & (norm["date"] <= pd.Timestamp(end))
+    return norm[mask] if mask.any() else None
+
+
 def get_monthly_return(name: str, symbol: str, start, end, is_index: bool = False) -> dict:
-    """v1 仅使用东财(push2)数据源取单标的当月收益。"""
+    """
+    取得单标的当月收益。多数据源兜底，命中即返回。
+    返回 dict，关键字段: name, symbol, status, base, end, ret, rows, note, src
+    status ∈ {ok, anomaly, no_data, error}
+    缺行情 → no_data (标注人工复核，不编造)；异常收益 → anomaly (仍给出计算值并标注)。
+    """
     start_str = start.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
-    try:
-        if is_index:
-            df = fetch_with_retry(
+
+    if is_index:
+        sources = [
+            ("东财指数", lambda: _extract_close(fetch_with_retry(
                 ak.index_zh_a_hist, symbol=symbol, period="daily",
-                start_date=start_str, end_date=end_str, adjust="")
-        else:
-            df = fetch_with_retry(
-                ak.stock_zh_a_hist, symbol=symbol, period="daily",
-                start_date=start_str, end_date=end_str, adjust="qfq")
-    except Exception as e:
-        return {"name": name, "symbol": symbol, "status": "error", "src": "东财",
-                "base": None, "end": None, "ret": None, "rows": 0,
-                "note": f"东财接口失败: {e}"}
-
-    if df is None or (hasattr(df, "empty") and df.empty) or "收盘" not in df.columns:
-        return {"name": name, "symbol": symbol, "status": "no_data", "src": "东财",
-                "base": None, "end": None, "ret": None, "rows": 0,
-                "note": "东财无交易数据(可能停牌/退市/无行情)，需人工复核"}
-    df = df[["日期", "收盘"]].copy()
-    df["日期"] = pd.to_datetime(df["日期"])
-    df["收盘"] = pd.to_numeric(df["收盘"], errors="coerce")
-    df = df.dropna().sort_values("日期").reset_index(drop=True)
-    if df.empty:
-        return {"name": name, "symbol": symbol, "status": "no_data", "src": "东财",
-                "base": None, "end": None, "ret": None, "rows": 0,
-                "note": "东财返回空，需人工复核"}
-
-    base = float(df.iloc[0]["收盘"])
-    end_c = float(df.iloc[-1]["收盘"])
-    if base <= 0:
-        return {"name": name, "symbol": symbol, "status": "error", "src": "东财",
-                "base": base, "end": end_c, "ret": None, "rows": len(df),
-                "note": f"月初收盘非正({base})，数据异常，需人工复核"}
-    ret = end_c / base - 1.0
-    if abs(ret) > ANOMALY_RETURN_THRESHOLD:
-        status, note = "anomaly", f"月收益异常(|r|>{ANOMALY_RETURN_THRESHOLD:.0%})，需人工复核"
+                start_date=start_str, end_date=end_str, adjust=""))),
+            ("新浪指数", lambda: _filter_range(
+                ak.stock_zh_index_daily(symbol="sh" + symbol), start, end)),
+        ]
     else:
-        status, note = "ok", f"[东财] 月初收盘{base:.2f}→月末收盘{end_c:.2f}，共{len(df)}个交易日"
-    return {"name": name, "symbol": symbol, "status": status, "src": "东财",
-            "base": base, "end": end_c, "ret": ret, "rows": len(df), "note": note}
+        sources = [
+            ("东财个股", lambda: _extract_close(fetch_with_retry(
+                ak.stock_zh_a_hist, symbol=symbol, period="daily",
+                start_date=start_str, end_date=end_str, adjust="qfq"))),
+            ("新浪个股", lambda: _extract_close(fetch_with_retry(
+                ak.stock_zh_a_daily, symbol=_sina_symbol(symbol),
+                start_date=start_str, end_date=end_str, adjust="qfq"))),
+        ]
+
+    last_err = None
+    for src_name, fn in sources:
+        try:
+            norm = fn()
+        except Exception as e:
+            last_err = f"[{src_name}] {e}"
+            continue
+        if norm is None or norm.empty:
+            last_err = f"[{src_name}] 无数据"
+            continue
+        base = float(norm.iloc[0]["close"])
+        end_c = float(norm.iloc[-1]["close"])
+        if base <= 0:
+            return {"name": name, "symbol": symbol, "status": "error", "src": src_name,
+                    "base": base, "end": end_c, "ret": None, "rows": len(norm),
+                    "note": f"月初收盘非正({base})，数据异常，需人工复核"}
+        ret = end_c / base - 1.0
+        if abs(ret) > ANOMALY_RETURN_THRESHOLD:
+            status, note = "anomaly", f"月收益异常(|r|>{ANOMALY_RETURN_THRESHOLD:.0%})，需人工复核"
+        else:
+            status, note = "ok", f"[{src_name}] 月初收盘{base:.2f}→月末收盘{end_c:.2f}，共{len(norm)}个交易日"
+        return {"name": name, "symbol": symbol, "status": status, "src": src_name,
+                "base": base, "end": end_c, "ret": ret, "rows": len(norm), "note": note}
+
+    # 所有数据源均失败 / 均无数据
+    if last_err and "无数据" not in last_err:
+        return {"name": name, "symbol": symbol, "status": "error", "src": "all",
+                "base": None, "end": None, "ret": None, "rows": 0,
+                "note": f"全部数据源失败: {last_err}"}
+    return {"name": name, "symbol": symbol, "status": "no_data", "src": "all",
+            "base": None, "end": None, "ret": None, "rows": 0,
+            "note": "当月所有数据源均无交易数据(可能停牌/退市/无行情)，需人工复核"}
 
 
+# ============================ 主流程 ============================
 def build_report(review_month: str):
     year, month = validate_month(review_month)
     start, end = month_bounds(year, month)
+
+    # ---- 逐标的取数：以 name 为 key 存入 dict，绝不用下标 ----
     results: Dict[str, dict] = {}
-    for name, symbol in STOCKS.items():
+    for name, symbol in STOCKS.items():          # 顺序无关，循环只为遍历 key
         rec = get_monthly_return(name, symbol, start, end, is_index=False)
-        results[name] = rec
-        time.sleep(SOURCE_DELAY)
+        results[name] = rec                       # key=名称，永久绑定
+        time.sleep(SOURCE_DELAY)                  # 节流，降低限流概率
+
+    # ---- 基准 ----
     bench = get_monthly_return(BENCHMARK_NAME, BENCHMARK_SYMBOL, start, end, is_index=True)
     bench_ret = bench.get("ret")
+
+    # 守恒校验：标的总数一致，且无任一标的被静默丢弃
     assert len(results) == len(STOCKS), "守恒失败：结果数≠配置标的数"
     for name in STOCKS:
         assert name in results, f"守恒失败：标的 '{name}' 被静默丢弃"
-    for name, rec in results.items():
+
+    # ---- 超额收益 & 贡献/拖累分类 ----
+    for name, rec in results.items():             # 遍历仍按 key
         if rec["ret"] is not None and bench_ret is not None:
             rec["excess"] = rec["ret"] - bench_ret
-            rec["role"] = "贡献" if rec["ret"] > bench_ret else ("拖累" if rec["ret"] < bench_ret else "持平")
+            if rec["ret"] > bench_ret:
+                rec["role"] = "贡献"
+            elif rec["ret"] < bench_ret:
+                rec["role"] = "拖累"
+            else:
+                rec["role"] = "持平"
         else:
             rec["excess"] = None
             rec["role"] = "待人工"
+
     return results, bench, bench_ret, review_month
 
 
+# ============================ 输出 ============================
 def render_console(results, bench, bench_ret, review_month):
     print("=" * 84)
     print(f"  A股月度持仓复盘  |  复盘月份: {review_month}  |  基准: {BENCHMARK_NAME}")
@@ -178,6 +251,7 @@ def render_console(results, bench, bench_ret, review_month):
     bret = f"{bench_ret*100:+.2f}%" if bench_ret is not None else "  --  "
     print("-" * 84)
     print(f"{BENCHMARK_NAME:<8}{bench['symbol']:<9}{bench['status']:<8}{bench.get('src',''):<8}{bret:>10}{'基准':>10}")
+    # 人工友好：异常/待人工 单独汇总
     manual = [r for r in results.values()
               if r["status"] in ("error", "no_data", "anomaly") or r["ret"] is None]
     if manual:
@@ -267,26 +341,28 @@ def send_email(review_month, text):
 
 
 def self_test_order(results):
+    """证明：打乱返回顺序后，按 name key 取数绝不串位。"""
     items = list(results.items())
     random.shuffle(items)
-    rebuilt = {n: r for n, r in items}
-    assert rebuilt == results
+    rebuilt = {n: r for n, r in items}      # 仍按 name 作 key
+    assert rebuilt == results               # dict 相等与顺序无关
     for n, r in results.items():
-        assert rebuilt[n] is r
+        assert rebuilt[n] is r              # 按 key 取数一致
     return True
 
 
+# ============================ 入口 ============================
 def main():
     if len(sys.argv) < 2:
         print("用法: python monthly_review.py YYYY-MM   (例: python monthly_review.py 2024-01)")
         print("可选环境变量: REVIEW_SMTP_HOST/PORT/USER/PASS 用于自动发邮件")
-        sys.exit(2)
+        sys.exit(2)  # 参数缺失 → 直接退出，绝不输出复盘 (一票否决)
     review_month = sys.argv[1]
     try:
         results, bench, bench_ret, rm = build_report(review_month)
     except ValueError as e:
         print(f"[参数错误] {e}")
-        sys.exit(2)
+        sys.exit(2)  # 参数非法 → 退出，不输出复盘
 
     render_console(results, bench, bench_ret, rm)
     csv_path, json_path = export_files(results, bench, bench_ret, rm)
