@@ -6,9 +6,9 @@ __pycache__/
 build/
 dist/
 
-# 本地临时产物（复盘结果按 data/ 目录归档，根目录散落文件不入库）
-review_report_*.csv
-review_report_*.json
+# 本地临时产物（复盘结果按 data/ 目录归档，仅忽略根目录散落文件，data/ 下保留）
+/review_report_*.csv
+/review_report_*.json
 
 # 环境与凭据
 .venv/
